@@ -729,48 +729,70 @@ export function forwardFetchResponse(from, to) {
     to.statusMessage = statusText;
 
     if (from.body && to.socket) {
-        // SSE heartbeat: send comment frames every 15s to prevent proxy timeouts
-        // (Cloudflare has a hard 100s timeout before first byte).
-        // SSE comments (lines starting with ':') are ignored by EventSource clients.
         const isSSE = (from.headers.get('content-type') || '').includes('text/event-stream');
-        let heartbeatInterval = null;
 
         if (isSSE) {
-            // Flush headers immediately so the proxy sees a 200 response right away
+            // SSE heartbeat: send comment frames every 15s to prevent proxy timeouts
+            // (Cloudflare has a hard 100s timeout before first byte).
+            // SSE comments (lines starting with ':') are ignored by EventSource clients.
+            // We avoid pipe() here and manually forward chunks so each SSE frame
+            // is flushed to the client immediately, preserving token-by-token streaming.
             to.setHeader('Content-Type', 'text/event-stream');
             to.setHeader('Cache-Control', 'no-cache');
             to.setHeader('Connection', 'keep-alive');
             to.setHeader('X-Accel-Buffering', 'no');
             to.flushHeaders();
 
-            heartbeatInterval = setInterval(() => {
+            let heartbeatInterval = setInterval(() => {
                 if (!to.writableEnded) {
                     to.write(': heartbeat\n\n');
                 }
             }, 15000);
+
+            const clearHeartbeat = () => {
+                if (heartbeatInterval) {
+                    clearInterval(heartbeatInterval);
+                    heartbeatInterval = null;
+                }
+            };
+
+            from.body.on('data', (chunk) => {
+                if (!to.writableEnded) {
+                    to.write(chunk);
+                }
+            });
+
+            from.body.on('end', () => {
+                clearHeartbeat();
+                console.info('Streaming request finished');
+                to.end();
+            });
+
+            from.body.on('error', (err) => {
+                clearHeartbeat();
+                console.error('Streaming request error:', err);
+                to.end();
+            });
+
+            to.socket.on('close', () => {
+                clearHeartbeat();
+                if (from.body instanceof Readable) from.body.destroy();
+                to.end();
+            });
+        } else {
+            // Non-SSE: use original pipe behavior
+            from.body.pipe(to);
+
+            to.socket.on('close', function () {
+                if (from.body instanceof Readable) from.body.destroy();
+                to.end();
+            });
+
+            from.body.on('end', function () {
+                console.info('Streaming request finished');
+                to.end();
+            });
         }
-
-        const clearHeartbeat = () => {
-            if (heartbeatInterval) {
-                clearInterval(heartbeatInterval);
-                heartbeatInterval = null;
-            }
-        };
-
-        from.body.pipe(to);
-
-        to.socket.on('close', function () {
-            clearHeartbeat();
-            if (from.body instanceof Readable) from.body.destroy(); // Close the remote stream
-
-            to.end(); // End the Express response
-        });
-
-        from.body.on('end', function () {
-            clearHeartbeat();
-            console.info('Streaming request finished');
-            to.end();
-        });
     } else {
         to.end();
     }
