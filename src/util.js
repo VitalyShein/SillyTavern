@@ -703,6 +703,8 @@ export function getImages(directoryPath, sortBy = 'name', type = MEDIA_REQUEST_T
 
 /**
  * Pipe a fetch() response to an Express.js Response, including status code.
+ * Sends SSE comment heartbeats to keep the connection alive through reverse proxies
+ * (e.g. Cloudflare 100s timeout) while waiting for the first data from the upstream.
  * @param {import('node-fetch').Response} from The Fetch API response to pipe from.
  * @param {import('express').Response} to The Express response to pipe to.
  */
@@ -727,15 +729,45 @@ export function forwardFetchResponse(from, to) {
     to.statusMessage = statusText;
 
     if (from.body && to.socket) {
+        // SSE heartbeat: send comment frames every 15s to prevent proxy timeouts
+        // (Cloudflare has a hard 100s timeout before first byte).
+        // SSE comments (lines starting with ':') are ignored by EventSource clients.
+        const isSSE = (from.headers.get('content-type') || '').includes('text/event-stream');
+        let heartbeatInterval = null;
+
+        if (isSSE) {
+            // Flush headers immediately so the proxy sees a 200 response right away
+            to.setHeader('Content-Type', 'text/event-stream');
+            to.setHeader('Cache-Control', 'no-cache');
+            to.setHeader('Connection', 'keep-alive');
+            to.setHeader('X-Accel-Buffering', 'no');
+            to.flushHeaders();
+
+            heartbeatInterval = setInterval(() => {
+                if (!to.writableEnded) {
+                    to.write(': heartbeat\n\n');
+                }
+            }, 15000);
+        }
+
+        const clearHeartbeat = () => {
+            if (heartbeatInterval) {
+                clearInterval(heartbeatInterval);
+                heartbeatInterval = null;
+            }
+        };
+
         from.body.pipe(to);
 
         to.socket.on('close', function () {
+            clearHeartbeat();
             if (from.body instanceof Readable) from.body.destroy(); // Close the remote stream
 
             to.end(); // End the Express response
         });
 
         from.body.on('end', function () {
+            clearHeartbeat();
             console.info('Streaming request finished');
             to.end();
         });
