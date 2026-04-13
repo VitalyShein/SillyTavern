@@ -3,16 +3,7 @@
 name: Create Docker Image (Release and Staging)
 
 on:
-  release:
-    # Allow pre-releases
-    types: [published]
-  schedule:
-    # Build the staging image everyday at 00:00 UTC
-    - cron: "0 0 * * *"
-  push:
-    # Temporary workaround
-    branches:
-      - release
+  workflow_dispatch:
 
 env:
   # This should allow creation of docker images even in forked repositories
